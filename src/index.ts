@@ -35,10 +35,21 @@ const CLAUDE_CODE_SYSTEM_PROMPT = "You are Claude Code, Anthropic's official CLI
 // Tool name prefix (opencode uses mcp_ prefix for tools)
 const TOOL_PREFIX = "mcp_";
 
+// Distributed lock constants for token refresh
+const LOCK_KEY = "token_refresh_lock";
+const LOCK_TTL_SECONDS = 30;       // Maximum time a lock can be held
+const LOCK_WAIT_INTERVAL_MS = 100; // Time between lock check retries
+const MAX_LOCK_WAIT_MS = 5000;     // Maximum time to wait for lock
+
 interface TokenData {
   accessToken: string;
   refreshToken: string;
   expiresAt: number;
+}
+
+interface RefreshLock {
+  holder: string;     // Unique request ID that holds the lock
+  acquiredAt: number; // Timestamp when lock was acquired
 }
 
 /**
@@ -91,29 +102,183 @@ async function refreshAccessToken(
 }
 
 /**
- * Get valid access token, refreshing if necessary
+ * Attempt to acquire a distributed lock for token refresh.
+ * Returns true if lock acquired, false if another request holds it.
+ */
+async function acquireLock(env: Env, requestId: string): Promise<boolean> {
+  const existingLock = await env.TOKEN_STORE.get(LOCK_KEY, "json") as RefreshLock | null;
+  
+  if (existingLock) {
+    const lockAge = Date.now() - existingLock.acquiredAt;
+    if (lockAge < LOCK_TTL_SECONDS * 1000) {
+      // Lock is held by another request and hasn't expired
+      return false;
+    }
+    // Lock has expired, we can take it over
+    console.log("Taking over expired lock from:", existingLock.holder);
+  }
+  
+  // Write our lock
+  const newLock: RefreshLock = {
+    holder: requestId,
+    acquiredAt: Date.now(),
+  };
+  
+  await env.TOKEN_STORE.put(LOCK_KEY, JSON.stringify(newLock), {
+    expirationTtl: LOCK_TTL_SECONDS,
+  });
+  
+  // Verify we actually got the lock (handles race between read and write)
+  await new Promise(resolve => setTimeout(resolve, 50));
+  
+  const currentLock = await env.TOKEN_STORE.get(LOCK_KEY, "json") as RefreshLock | null;
+  const gotLock = currentLock?.holder === requestId;
+  
+  if (gotLock) {
+    console.log("Lock acquired:", requestId);
+  }
+  
+  return gotLock;
+}
+
+/**
+ * Release the distributed lock if we hold it.
+ */
+async function releaseLock(env: Env, requestId: string): Promise<void> {
+  const currentLock = await env.TOKEN_STORE.get(LOCK_KEY, "json") as RefreshLock | null;
+  
+  if (currentLock?.holder === requestId) {
+    await env.TOKEN_STORE.delete(LOCK_KEY);
+    console.log("Lock released:", requestId);
+  }
+}
+
+/**
+ * Wait for another request to finish refreshing tokens.
+ */
+async function waitForLockRelease(env: Env): Promise<void> {
+  const startTime = Date.now();
+  
+  while (Date.now() - startTime < MAX_LOCK_WAIT_MS) {
+    const lock = await env.TOKEN_STORE.get(LOCK_KEY, "json") as RefreshLock | null;
+    
+    if (!lock) {
+      console.log("Lock released, proceeding...");
+      return;
+    }
+    
+    if (Date.now() - lock.acquiredAt >= LOCK_TTL_SECONDS * 1000) {
+      console.log("Lock expired, proceeding...");
+      return;
+    }
+    
+    await new Promise(resolve => setTimeout(resolve, LOCK_WAIT_INTERVAL_MS));
+  }
+  
+  console.log("Timeout waiting for lock release");
+}
+
+/**
+ * Refresh access token with fallback to environment secret.
+ */
+async function refreshTokenWithRetry(
+  env: Env,
+  cached: TokenData | null
+): Promise<TokenData> {
+  const refreshToken = cached?.refreshToken || env.CLAUDE_REFRESH_TOKEN;
+  
+  try {
+    console.log("Attempting token refresh with", cached?.refreshToken ? "cached token" : "env token");
+    const newTokens = await refreshAccessToken(refreshToken, env.CLAUDE_OAUTH_CLIENT_ID);
+    
+    // Store in KV WITHOUT TTL - critical fix!
+    await env.TOKEN_STORE.put("tokens", JSON.stringify(newTokens));
+    console.log("Tokens refreshed successfully, expires at:", new Date(newTokens.expiresAt).toISOString());
+    
+    return newTokens;
+  } catch (primaryError) {
+    console.error("Primary refresh failed:", primaryError);
+    
+    // Only try fallback if we used a cached token AND it's different from env secret
+    if (cached?.refreshToken && cached.refreshToken !== env.CLAUDE_REFRESH_TOKEN) {
+      console.log("Attempting fallback refresh with environment token...");
+      
+      try {
+        const newTokens = await refreshAccessToken(
+          env.CLAUDE_REFRESH_TOKEN,
+          env.CLAUDE_OAUTH_CLIENT_ID
+        );
+        
+        await env.TOKEN_STORE.put("tokens", JSON.stringify(newTokens));
+        console.log("Fallback refresh succeeded");
+        
+        return newTokens;
+      } catch (fallbackError) {
+        console.error("Fallback refresh also failed:", fallbackError);
+        throw new Error(
+          `Token refresh failed. Primary error: ${String(primaryError)}. ` +
+          `Fallback error: ${String(fallbackError)}. Re-authentication is required.`
+        );
+      }
+    }
+    
+    throw primaryError;
+  }
+}
+
+/**
+ * Get valid access token with distributed locking and retry logic.
  */
 async function getValidToken(env: Env): Promise<string> {
-  // Try to get cached token from KV
+  const requestId = crypto.randomUUID();
+  
+  // First check: is token valid without refreshing?
   const cached = await env.TOKEN_STORE.get("tokens", "json") as TokenData | null;
   
   if (cached && cached.expiresAt > Date.now() + 60000) {
-    // Token is valid for at least 1 more minute
     return cached.accessToken;
   }
 
-  // Need to refresh
-  const refreshToken = cached?.refreshToken || env.CLAUDE_REFRESH_TOKEN;
+  console.log("Token expired or missing, attempting refresh. Request ID:", requestId);
+
+  // Try to acquire the refresh lock
+  let gotLock = await acquireLock(env, requestId);
   
-  console.log("Refreshing access token...");
-  const newTokens = await refreshAccessToken(refreshToken, env.CLAUDE_OAUTH_CLIENT_ID);
-  
-  // Store in KV
-  await env.TOKEN_STORE.put("tokens", JSON.stringify(newTokens), {
-    expirationTtl: 86400, // 24 hours
-  });
-  
-  return newTokens.accessToken;
+  if (!gotLock) {
+    console.log("Another request is refreshing, waiting...");
+    await waitForLockRelease(env);
+    
+    // After waiting, check if token is now valid
+    const refreshedToken = await env.TOKEN_STORE.get("tokens", "json") as TokenData | null;
+    
+    if (refreshedToken && refreshedToken.expiresAt > Date.now() + 60000) {
+      console.log("Token refreshed by another request, using it");
+      return refreshedToken.accessToken;
+    }
+    
+    console.log("Token still invalid after wait, attempting to acquire lock...");
+    gotLock = await acquireLock(env, requestId);
+    
+    if (!gotLock) {
+      throw new Error("Could not acquire token refresh lock after waiting");
+    }
+  }
+
+  try {
+    // Double-check token validity
+    const recheck = await env.TOKEN_STORE.get("tokens", "json") as TokenData | null;
+    
+    if (recheck && recheck.expiresAt > Date.now() + 60000) {
+      console.log("Token already refreshed by another request");
+      return recheck.accessToken;
+    }
+
+    const newTokens = await refreshTokenWithRetry(env, recheck);
+    return newTokens.accessToken;
+    
+  } finally {
+    await releaseLock(env, requestId);
+  }
 }
 
 /**
@@ -256,8 +421,24 @@ async function handleMessages(request: Request, env: Env): Promise<Response> {
     accessToken = await getValidToken(env);
   } catch (e) {
     console.error("Failed to get access token:", e);
-    return new Response(JSON.stringify({ error: "Token error", message: String(e) }), {
-      status: 500,
+    
+    const errorMessage = String(e);
+    const needsReauth = 
+      errorMessage.includes("invalid_grant") ||
+      errorMessage.includes("invalid_token") ||
+      errorMessage.includes("expired") ||
+      errorMessage.includes("revoked") ||
+      errorMessage.includes("Re-authentication");
+    
+    return new Response(JSON.stringify({
+      error: {
+        type: needsReauth ? "authentication_required" : "token_error",
+        message: needsReauth
+          ? "OAuth refresh token has expired or been revoked. Please run: node scripts/oauth-login.js"
+          : `Token error: ${errorMessage}`,
+      },
+    }), {
+      status: needsReauth ? 401 : 500,
       headers: { "Content-Type": "application/json" },
     });
   }
