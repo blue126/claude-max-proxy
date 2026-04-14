@@ -37,7 +37,7 @@ const TOOL_PREFIX = "mcp_";
 
 // Distributed lock constants for token refresh
 const LOCK_KEY = "token_refresh_lock";
-const LOCK_TTL_SECONDS = 30;       // Maximum time a lock can be held
+const LOCK_TTL_SECONDS = 60;       // Maximum time a lock can be held
 const LOCK_WAIT_INTERVAL_MS = 100; // Time between lock check retries
 const MAX_LOCK_WAIT_MS = 5000;     // Maximum time to wait for lock
 
